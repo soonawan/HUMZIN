@@ -1,0 +1,114 @@
+{
+  "name": "AI Humanizer - /humanize",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "humanize",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "webhookId": "humanize-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── Step 1: Parse incoming payload ───────────────────────────────────────\n// Supports two modes:\n//   A) file_base64 + file_type='docx'  → parse the .docx into blocks\n//   B) text (plain string)              → treat whole text as one block\n\nconst body = $input.first().json.body;\n\nif (!body) {\n  throw new Error('Empty request body');\n}\n\nconst mode = body.mode || 'gentle';\n\nif (body.text) {\n  // ── TEXT MODE ────────────────────────────────────────────────\n  // Split on double newlines or treat each line as a block\n  const raw = body.text.trim();\n  const paragraphs = raw.split(/\\n\\n+/).filter(p => p.trim().length > 0);\n\n  const blocks = paragraphs.map((p, i) => ({\n    id: `p${i}`,\n    type: p.trimStart().startsWith('-') || p.trimStart().startsWith('•') || p.trimStart().match(/^\\d+\\./) ? 'bullet' : 'paragraph',\n    text: p.trim()\n  }));\n\n  return [{\n    json: {\n      input_type: 'text',\n      mode,\n      blocks\n    }\n  }];\n}\n\nif (body.file_base64 && body.file_type === 'docx') {\n  // ── DOCX MODE ────────────────────────────────────────────────\n  // Pass through for the next node to parse with mammoth\n  return [{\n    json: {\n      input_type: 'docx',\n      mode,\n      file_base64: body.file_base64,\n      blocks: [] // will be filled by Parse DOCX node\n    }\n  }];\n}\n\nthrow new Error('Invalid payload: provide either text or file_base64+file_type=docx');"
+      },
+      "id": "parse-payload",
+      "name": "Parse Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── Step 2: Parse .docx into blocks (only runs for docx input) ──────────\n// Uses mammoth (available in n8n's Node.js environment) to extract\n// paragraph and bullet text, leaving tables/images/equations untouched.\n\nconst item = $input.first().json;\n\nif (item.input_type !== 'docx') {\n  // Not a docx — pass through unchanged\n  return [$input.first()];\n}\n\n// Decode base64 → Buffer\nconst mammoth = require('mammoth');\nconst buffer = Buffer.from(item.file_base64, 'base64');\n\n// Extract raw text with paragraph structure\nconst result = await mammoth.extractRawText({ buffer });\nconst rawText = result.value;\n\n// Split into paragraphs (mammoth uses \\n between paragraphs)\nconst lines = rawText.split('\\n').filter(l => l.trim().length > 0);\n\nconst blocks = lines.map((line, i) => {\n  const trimmed = line.trim();\n  const isBullet = trimmed.startsWith('•') ||\n                   trimmed.startsWith('-') ||\n                   trimmed.startsWith('*') ||\n                   /^\\d+\\.\\s/.test(trimmed);\n  return {\n    id: `block_${i}`,\n    type: isBullet ? 'bullet' : 'paragraph',\n    text: trimmed\n  };\n});\n\nreturn [{\n  json: {\n    ...item,\n    blocks\n  }\n}];"
+      },
+      "id": "parse-docx",
+      "name": "Parse DOCX",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── Step 3: Rewrite each block with Groq (Llama) ────────────────────────\n// Calls Groq API for each block. Batches in groups of 5 to avoid timeout.\n// The product-level prompt is baked here — users never see or change it.\n\nconst item = $input.first().json;\nconst { blocks, mode } = item;\n\nconst GROQ_API_KEY = $env.GROQ_API_KEY;\nif (!GROQ_API_KEY) throw new Error('GROQ_API_KEY env variable not set in n8n');\n\nconst GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';\nconst MODEL = 'llama3-8b-8192'; // fast, free on Groq\n\nconst modeInstructions = mode === 'aggressive'\n  ? `Apply ALL of the following heavily:\n   - Substantially restructure sentences and paragraph order.\n   - Break complex sentences into several short punchy ones, and occasionally merge short ones.\n   - Add informal transitions freely: \"In practice,\" \"Anyway,\" \"For example,\" \"In my experience,\"\n   - Include one deliberate mild typo or spacing irregularity per paragraph.\n   - Allow one small natural digression per paragraph (keep same meaning).`\n  : `Apply the following lightly:\n   - Make moderate sentence-level changes (reorder, split, combine).\n   - Add 1–2 informal transitions per block: \"In practice,\" \"For example,\"\n   - One very mild typo or spacing irregularity per every 3–4 paragraphs.\n   - No large structural changes.`;\n\nconst SYSTEM_PROMPT = `You are an AI-text humanizer. Your job is to rewrite paragraphs and bullet points so they sound like a real human wrote them — not an AI.\n\nRules you must always follow:\n1. Preserve the original meaning and all key facts exactly. Do not add new claims or remove essential information.\n2. Only rewrite the given text block. Do not change layout, numbering, or add/remove sections.\n3. Rewrite technique — semantic rewrite, NOT word-swap:\n   - Change sentence order.\n   - Combine short sentences when it sounds natural.\n   - Break long sentences when it improves readability.\n   - Never just replace words with synonyms.\n4. ${modeInstructions}\n5. Remove or paraphrase obvious AI-tell phrases like \"It is important to note that\", \"In conclusion\", \"Firstly\", \"Furthermore\", \"In summary\", \"It is worth mentioning\".\n6. Output ONLY the rewritten text. No comments, no annotations, no explanations, no quotation marks around the output.`;\n\n// Helper: call Groq for one block\nasync function rewriteBlock(block) {\n  const userMsg = `Rewrite this ${block.type}:\\n\\n${block.text}`;\n\n  const response = await fetch(GROQ_URL, {\n    method: 'POST',\n    headers: {\n      'Content-Type': 'application/json',\n      'Authorization': `Bearer ${GROQ_API_KEY}`\n    },\n    body: JSON.stringify({\n      model: MODEL,\n      messages: [\n        { role: 'system', content: SYSTEM_PROMPT },\n        { role: 'user', content: userMsg }\n      ],\n      temperature: mode === 'aggressive' ? 0.9 : 0.7,\n      max_tokens: 1024\n    })\n  });\n\n  if (!response.ok) {\n    const err = await response.text();\n    console.error('Groq error:', err);\n    return block.text; // fallback: return original\n  }\n\n  const data = await response.json();\n  return data.choices?.[0]?.message?.content?.trim() || block.text;\n}\n\n// Process blocks in batches of 5\nconst rewrittenBlocks = [];\nconst BATCH_SIZE = 5;\n\nfor (let i = 0; i < blocks.length; i += BATCH_SIZE) {\n  const batch = blocks.slice(i, i + BATCH_SIZE);\n  const results = await Promise.all(batch.map(b => rewriteBlock(b)));\n  results.forEach((rewritten, j) => {\n    rewrittenBlocks.push({\n      ...blocks[i + j],\n      rewritten_text: rewritten\n    });\n  });\n}\n\nreturn [{\n  json: {\n    ...item,\n    rewritten_blocks: rewrittenBlocks\n  }\n}];"
+      },
+      "id": "rewrite-blocks",
+      "name": "Rewrite Blocks with Groq",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── Step 4: Rebuild document / text ─────────────────────────────────────\n// For text mode: reassemble paragraphs with double newlines.\n// For docx mode: reassemble text then re-pack into a .docx buffer using\n//   docxtemplater + pizzip, keeping images/tables/metadata untouched.\n\nconst item = $input.first().json;\nconst { input_type, rewritten_blocks, file_base64 } = item;\n\nif (input_type === 'text') {\n  // ── TEXT: just join rewritten paragraphs ────────────────────\n  const finalText = rewritten_blocks\n    .map(b => b.rewritten_text || b.text)\n    .join('\\n\\n');\n\n  return [{\n    json: {\n      status: 'success',\n      output_type: 'text',\n      result: finalText\n    }\n  }];\n}\n\n// ── DOCX: replace paragraph text in the original .docx XML ─────────────\n// Strategy: use PizZip to unzip the docx, find w:p (paragraph) nodes in\n// word/document.xml, replace their text content with rewritten versions,\n// then re-zip and return as base64.\n\nconst PizZip = require('pizzip');\n\n// Decode original docx\nconst originalBuffer = Buffer.from(file_base64, 'base64');\nconst zip = new PizZip(originalBuffer);\n\n// Get the main document XML\nlet xml = zip.file('word/document.xml').asText();\n\n// Build a mapping: original text → rewritten text\nconst replacements = new Map();\nrewritten_blocks.forEach(block => {\n  if (block.text && block.rewritten_text && block.text !== block.rewritten_text) {\n    replacements.set(block.text, block.rewritten_text);\n  }\n});\n\n// Replace text in XML paragraph nodes\n// This works for paragraphs where the full text is in one w:t node.\n// For complex paragraphs (split across runs), we fall back gracefully.\nfor (const [original, rewritten] of replacements.entries()) {\n  // Escape original for use in regex\n  const escaped = original.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n  // Replace within <w:t> tags\n  const re = new RegExp(`(<w:t[^>]*>)${escaped}(</w:t>)`, 'g');\n  xml = xml.replace(re, `$1${rewritten}$2`);\n}\n\n// Write modified XML back into zip\nzip.file('word/document.xml', xml);\n\n// Generate new docx buffer and encode as base64\nconst outputBuffer = zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });\nconst outputBase64 = outputBuffer.toString('base64');\n\nreturn [{\n  json: {\n    status: 'success',\n    output_type: 'docx',\n    result: outputBase64\n  }\n}];"
+      },
+      "id": "rebuild-document",
+      "name": "Rebuild Document",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "id": "http-response",
+      "name": "HTTP Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1300, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [{ "node": "Parse Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Payload": {
+      "main": [
+        [{ "node": "Parse DOCX", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse DOCX": {
+      "main": [
+        [{ "node": "Rewrite Blocks with Groq", "type": "main", "index": 0 }]
+      ]
+    },
+    "Rewrite Blocks with Groq": {
+      "main": [
+        [{ "node": "Rebuild Document", "type": "main", "index": 0 }]
+      ]
+    },
+    "Rebuild Document": {
+      "main": [
+        [{ "node": "HTTP Response", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
